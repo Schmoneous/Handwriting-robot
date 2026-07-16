@@ -1,0 +1,37 @@
+
+# requirements.txt -- DrawCore + RNN handwriting engine, combined
+# ===================================================================
+# Install into the handwriting-synthesis/venv (Python 3.11 -- confirmed
+# working combination; Python 3.13 can't run this stack, see conversation
+# history for why: tensorflow_probability has no 3.13 wheel yet).
+#
+#   cd ~/Downloads/HandWriting_Robot/handwriting-synthesis
+#   source venv/bin/activate
+#   pip install -r requirements.txt
+#
+# tkinter is NOT pip-installable -- if the GUI fails to launch with a
+# tkinter import error, run:
+#   brew install python-tk@3.11
+ 
+ 
+# --- RNN / handwriting-synthesis (Graves 2013 model) ---
+tensorflow==2.13.0
+tensorflow_probability==0.21.0
+# ^ 0.21.0 is the specific tfp release tested/stable against TF 2.13 --
+#   confirmed via TFP's own release notes. Do not bump either of these
+#   independently; they must move together (see the tensorflow/probability
+#   release notes for which tfp version pairs with which tf version if you
+#   ever need to upgrade both).
+matplotlib>=2.1.0
+pandas>=0.22.0
+scikit-learn>=0.19.1
+scipy>=1.0.0
+svgwrite>=1.1.12
+ 
+# --- DrawCore GUI / Hershey / EBB pipeline ---
+hershey-fonts
+vnoise
+pyserial
+python-docx
+pypdf
+ 
