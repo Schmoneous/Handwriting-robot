@@ -103,6 +103,22 @@ def _repo_cwd():
         yield
 
 
+# Hard ceiling confirmed directly from the installed model's source:
+# handwriting_synthesis/hand/Hand.py has `chars = np.zeros([num_samples, 120])`
+# -- a fixed-size buffer with NO room for anything longer, regardless of
+# physical page width or font_size_mm. Exceeding it crashes with
+# "ValueError: could not broadcast input array from shape (N,) into shape
+# (120,)" deep inside the model's _sample() method. wrap_text() previously
+# only checked physical page-width fit, which could pack MORE than 120
+# characters onto one line if font_size_mm was small enough to make many
+# characters "fit" the configured page width -- this cap prevents that
+# regardless of font size. A small safety margin (10 chars) is kept below
+# the hard 120 limit in case of any off-by-one in the model's own internal
+# handling (e.g. an implicit end-of-sequence marker).
+RNN_MAX_CHARS_PER_LINE = 120
+RNN_SAFE_MAX_CHARS_PER_LINE = 110
+
+
 class RNNStrokeSource:
     """Thin wrapper around handwriting_synthesis.hand.Hand that returns raw
     (T, 3) stroke arrays [dx, dy, pen_lift_bit] instead of writing SVG."""
@@ -273,6 +289,13 @@ class RNNHandwritingGenerator:
         the full page width) -- this fixes that by measuring the real
         thing instead of guessing.
 
+        Also enforces RNN_SAFE_MAX_CHARS_PER_LINE regardless of physical
+        page width fit -- the model has a hard 120-character buffer (see
+        RNN_MAX_CHARS_PER_LINE above) that has nothing to do with font
+        size or page width, and a small font_size_mm can otherwise pack
+        more characters onto one "physically fitting" line than the model
+        can actually accept, crashing generation entirely.
+
         font_scale: same convention as HandwritingGenerator.wrap_text --
         pass a value >1.0 for headings (wider characters at a larger size
         need fewer characters per line to fit the same physical width).
@@ -280,7 +303,9 @@ class RNNHandwritingGenerator:
         cfg = self.cfg
         width_mm = width_mm if width_mm is not None else cfg["page_width_mm"]
         mm_per_char = self._get_mm_per_char() * font_scale
-        max_chars_guess = max(6, int(width_mm / mm_per_char))
+        width_based_guess = max(6, int(width_mm / mm_per_char))
+        max_chars_guess = min(width_based_guess, RNN_SAFE_MAX_CHARS_PER_LINE)
+
         lines = []
         for paragraph in text.split("\n"):
             words = paragraph.split(" ")
@@ -293,7 +318,23 @@ class RNNHandwritingGenerator:
                 else:
                     cur = trial
             lines.append(cur)
-        return lines
+
+        # Safety net: the word-based loop above only breaks BETWEEN words,
+        # so a single word (or a bullet/numbered marker + word) longer than
+        # max_chars_guess on its own would still slip through over the
+        # limit. Force-split anything that's still too long -- this is a
+        # last-resort hard character split, not word-aware, but it
+        # guarantees the model's 120-char buffer is never exceeded no
+        # matter what.
+        safe_lines = []
+        for line in lines:
+            if len(line) <= RNN_SAFE_MAX_CHARS_PER_LINE:
+                safe_lines.append(line)
+            else:
+                for i in range(0, len(line), RNN_SAFE_MAX_CHARS_PER_LINE):
+                    safe_lines.append(line[i:i + RNN_SAFE_MAX_CHARS_PER_LINE])
+
+        return safe_lines
 
     def _line_to_strokes(
         self, line_text: str, x_start: float, y_baseline: float, font_scale: float = 1.0
@@ -316,6 +357,23 @@ class RNNHandwritingGenerator:
 
         effective_scale = self._get_scale() / font_scale
         sanitized = self._sanitize_for_rnn(line_text)
+
+        # Last-resort defensive guard, regardless of how this method was
+        # reached (wrap_text's cap, generate_blocks' marker concatenation,
+        # or any other caller). This has repeatedly crashed in practice
+        # with "could not broadcast input array from shape (N,) into shape
+        # (120,)" from unexpected code paths that were hard to pin down
+        # exactly -- rather than keep chasing every possible source, this
+        # guarantees it can never happen again, while still surfacing a
+        # clear, traceable warning (with the actual offending text) instead
+        # of a cryptic numpy error deep inside the model.
+        if len(sanitized) > RNN_SAFE_MAX_CHARS_PER_LINE:
+            print(f"[handwriting_rnn] WARNING: line was {len(sanitized)} chars "
+                  f"(limit {RNN_SAFE_MAX_CHARS_PER_LINE}), truncating. This means "
+                  f"something upstream of _line_to_strokes let an oversized line "
+                  f"through -- original text: {line_text!r}")
+            sanitized = sanitized[:RNN_SAFE_MAX_CHARS_PER_LINE]
+
         raw = self._source.sample_lines([sanitized], biases=[self.bias], styles=[self.style])[0]
 
         segments: List[List[Tuple[float, float]]] = []
@@ -340,6 +398,19 @@ class RNNHandwritingGenerator:
             strokes.append(pts_mm)
         return strokes
 
+    def _jittered_x_start(self, base_x: float) -> float:
+        """
+        Returns base_x plus a small random +/- offset (line_start_x_jitter_mm),
+        so successive lines don't all begin at the exact same horizontal
+        position -- real handwriting has natural left-margin inconsistency
+        between lines/sentences that a perfectly fixed x_start doesn't capture.
+        Uses self.rng (seeded), so this is reproducible given the same seed.
+        """
+        jitter = self.cfg.get("line_start_x_jitter_mm", 0.0)
+        if jitter <= 0:
+            return base_x
+        return base_x + self.rng.uniform(-jitter, jitter)
+
     def generate(self, text: str) -> List[List[Tuple[float, float]]]:
         cfg = self.cfg
         strokes_out: List[List[Tuple[float, float]]] = []
@@ -347,7 +418,8 @@ class RNNHandwritingGenerator:
         y_cursor = cfg["y_offset_mm"]
         line_dir = -1 if cfg.get("reverse_line_direction") else 1
         for line in lines:
-            strokes_out.extend(self._line_to_strokes(line, cfg["x_offset_mm"], y_cursor))
+            x_start = self._jittered_x_start(cfg["x_offset_mm"])
+            strokes_out.extend(self._line_to_strokes(line, x_start, y_cursor))
             y_cursor += line_dir * cfg["line_spacing_mm"]
         return strokes_out
 
@@ -395,8 +467,9 @@ class RNNHandwritingGenerator:
                     y_cursor += line_dir * cfg["line_spacing_mm"] * 0.4
                 lines = self.wrap_text(block["text"], font_scale=scale)
                 for line in lines:
+                    x_start = self._jittered_x_start(cfg["x_offset_mm"])
                     strokes_out.extend(
-                        self._line_to_strokes(line, cfg["x_offset_mm"], y_cursor, font_scale=scale))
+                        self._line_to_strokes(line, x_start, y_cursor, font_scale=scale))
                     y_cursor += line_dir * cfg["line_spacing_mm"] * scale
                 y_cursor += line_dir * cfg["line_spacing_mm"] * 0.3
 
@@ -405,7 +478,8 @@ class RNNHandwritingGenerator:
                 marker = "- "
                 lines = self.wrap_text(marker + block["text"], width_mm=cfg["page_width_mm"] - INDENT_MM)
                 for i, line in enumerate(lines):
-                    x_start = x_indent if i == 0 else x_indent + INDENT_MM * 0.6
+                    base_x = x_indent if i == 0 else x_indent + INDENT_MM * 0.6
+                    x_start = self._jittered_x_start(base_x)
                     strokes_out.extend(self._line_to_strokes(line, x_start, y_cursor))
                     y_cursor += line_dir * cfg["line_spacing_mm"]
 
@@ -415,14 +489,16 @@ class RNNHandwritingGenerator:
                 marker = f"{numbered_counter}. "
                 lines = self.wrap_text(marker + block["text"], width_mm=cfg["page_width_mm"] - INDENT_MM)
                 for i, line in enumerate(lines):
-                    x_start = x_indent if i == 0 else x_indent + INDENT_MM * 0.6
+                    base_x = x_indent if i == 0 else x_indent + INDENT_MM * 0.6
+                    x_start = self._jittered_x_start(base_x)
                     strokes_out.extend(self._line_to_strokes(line, x_start, y_cursor))
                     y_cursor += line_dir * cfg["line_spacing_mm"]
 
             else:  # paragraph
                 lines = self.wrap_text(block["text"])
                 for line in lines:
-                    strokes_out.extend(self._line_to_strokes(line, cfg["x_offset_mm"], y_cursor))
+                    x_start = self._jittered_x_start(cfg["x_offset_mm"])
+                    strokes_out.extend(self._line_to_strokes(line, x_start, y_cursor))
                     y_cursor += line_dir * cfg["line_spacing_mm"]
 
             prev_type = btype

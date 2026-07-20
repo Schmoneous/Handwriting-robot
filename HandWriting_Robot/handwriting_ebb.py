@@ -169,8 +169,24 @@ def stream_ebb(commands, port, baud=115200, verbose=True, pen_settle_s=0.2):
                 print(f"[{i+1}/{len(commands)}] {cmd}  ->  {resp}")
             if any("err" in r.lower() for r in resp_lines):
                 print(f"!! Board reported an error on: {cmd}", file=sys.stderr)
+
             if cmd.startswith("SP,"):
                 time.sleep(pen_settle_s)
+            elif cmd.startswith("XM,") or cmd.startswith("SM,"):
+                # IMPORTANT: the board's "OK" response means the command was
+                # accepted/queued, NOT that the physical motion has finished
+                # executing yet. If we send the next command (especially a
+                # pen-lift SP right after the last stroke of a line) before
+                # this move's own declared duration has actually elapsed, it
+                # can cut the current stroke off mid-motion -- this is what
+                # causes letters at the start/end of a line to look
+                # incomplete. So we explicitly wait out the move's own
+                # duration here, on top of waiting for OK.
+                try:
+                    duration_ms = int(cmd.split(",")[1])
+                    time.sleep(duration_ms / 1000.0)
+                except (IndexError, ValueError):
+                    pass
 
 
 def test_pen(port, baud=115200):

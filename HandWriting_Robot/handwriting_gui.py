@@ -46,6 +46,14 @@ except ImportError:
                                      # at import time -- see _generate().
 
 try:
+    from handwriting_verify import HandwritingVerifier, VerifiedRNNHandwritingGenerator
+except ImportError:
+    HandwritingVerifier = None
+    VerifiedRNNHandwritingGenerator = None  # Verify checkbox still shows, but
+                                             # checking it reports a clear error
+                                             # instead of crashing -- see _generate().
+
+try:
     from serial.tools import list_ports
 except ImportError:
     list_ports = None
@@ -99,6 +107,7 @@ class HandwritingApp(tk.Tk):
         self.log_queue = queue.Queue()
         self.busy = False
         self.pen_test_event = threading.Event()
+        self._cached_verifier = None  # lazy-loaded on first use -- see _get_verifier()
 
         self._build_ui()
         self._poll_log_queue()
@@ -180,6 +189,13 @@ class HandwritingApp(tk.Tk):
         ttk.Label(self.rnn_controls_frame, text="Style (0-12):").grid(row=0, column=2, sticky="w")
         self.rnn_style_var = tk.StringVar(value="9")
         ttk.Entry(self.rnn_controls_frame, textvariable=self.rnn_style_var, width=6).grid(row=0, column=3, padx=4)
+
+        self.verify_var = tk.BooleanVar(value=False)
+        self.verify_chk = ttk.Checkbutton(
+            self.rnn_controls_frame,
+            text="Verify with recognition model before writing (slower, catches garbled letters)",
+            variable=self.verify_var)
+        self.verify_chk.grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
         # --- Font preset (Hershey mode only -- EMS Casual Hand lives here, unchanged) ---
         ttk.Label(style_frame, text="Font:").grid(row=2, column=0, sticky="w", padx=8, pady=6)
@@ -396,6 +412,7 @@ class HandwritingApp(tk.Tk):
         self.font_preset_combo.configure(state=font_state)
         self.custom_exclusive_chk.configure(state="disabled" if is_rnn else "normal")
         self.print_style_chk.configure(state="disabled" if is_rnn else "normal")
+        self.verify_chk.configure(state="normal" if is_rnn else "disabled")
 
         if not is_rnn:
             # Restore the correct choose-font button enabled/disabled state,
@@ -768,6 +785,17 @@ class HandwritingApp(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _get_verifier(self):
+        """
+        Lazily constructs and caches the HandwritingVerifier -- its model
+        weights only need to load once per app session, not once per
+        generation. First call is slow (model init); subsequent calls
+        reuse the same instance instantly.
+        """
+        if self._cached_verifier is None:
+            self._cached_verifier = HandwritingVerifier()
+        return self._cached_verifier
+
     def _generate(self):
         text, blocks = self._get_text_or_blocks()
         cfg = self._build_cfg()
@@ -787,10 +815,39 @@ class HandwritingApp(tk.Tk):
                 cfg, rng_seed=seed,
                 bias=cfg.get("_rnn_bias", 0.75),
                 style=cfg.get("_rnn_style", 9))
+
+            if self.verify_var.get():
+                if VerifiedRNNHandwritingGenerator is None or HandwritingVerifier is None:
+                    raise RuntimeError(
+                        "Verify option is checked, but handwriting_verify.py (or its "
+                        "easyocr dependency) isn't importable in this environment. "
+                        "Uncheck Verify, or run: pip install easyocr"
+                    )
+                self.log_queue.put("Loading handwriting-recognition model for verification"
+                                    " (first use only, may take a moment)...\n")
+                verifier = self._get_verifier()
+                gen = VerifiedRNNHandwritingGenerator(gen, verifier, similarity_threshold=0.55)
+
             if blocks is not None:
                 strokes = gen.generate_blocks(blocks)
             else:
                 strokes = gen.generate(text)
+
+            flagged = getattr(gen, "flagged_lines", None)
+            if flagged:
+                self.log_queue.put(
+                    f"WARNING: {len(flagged)} line(s) did not pass handwriting verification "
+                    f"even after retries:\n")
+                detail_lines = []
+                for f in flagged:
+                    line_msg = (f"  expected {f['text']!r}, model read back "
+                                f"{f['recognized']!r} (similarity {f['similarity']:.2f})\n")
+                    self.log_queue.put(line_msg)
+                    detail_lines.append(line_msg.strip())
+                self.log_queue.put("__WARN_POPUP__:Some lines did not pass handwriting "
+                                    "verification:\n\n" + "\n".join(detail_lines) +
+                                    "\n\nYou can still write with the robot, but these "
+                                    "specific lines may come out garbled or misread.")
         else:
             gen = HandwritingGenerator(cfg, rng_seed=seed)
             if blocks is not None:

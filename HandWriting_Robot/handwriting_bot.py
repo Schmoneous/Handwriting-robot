@@ -81,7 +81,7 @@ DEFAULTS = dict(
                              # between them per letter gives REAL shape variation, not
                              # just scaled/skewed copies of one glyph. Set to [] or a
                              # single-item list to disable and use `font` only.
-    font_size_mm=6.0,        # cap-height of letters, in mm
+    font_size_mm=9.0,        # cap-height of letters, in mm
     line_spacing_mm=10.0,    # distance between baselines when text wraps
     page_width_mm=180.0,     # usable writing width -- wrap width AND a hard bound check
     page_height_mm=250.0,    # usable writing height -- checked after generation; you'll
