@@ -134,26 +134,24 @@ def rasterize_strokes(
     for stroke in strokes:
         if len(stroke) < 2:
             continue
-        # NOTE: y is flipped here (max_y - y, not y - min_y). PIL's pixel
-        # space has row 0 at the TOP with y increasing downward, but this
-        # data's y-convention (confirmed empirically during earlier RNN
-        # debugging -- see preview_natural.py) reads correctly WITHOUT
-        # inversion in matplotlib's default (y-increases-upward) rendering.
-        # A direct/unflipped mapping into PIL's downward-y pixel space was
-        # therefore producing vertically flipped (upside-down) images --
-        # which is almost certainly why EVERY line failed OCR verification
-        # across an entire real document: EasyOCR was being shown upside-
-        # down cursive, not illegible-but-rightside-up cursive.
-        #
-        # IMPORTANT: this assumes your RNN's raw stroke output uses the
-        # same y-up convention as the Hershey-based pipeline this project
-        # also contains. If handwriting_rnn.py's stroke convention is
-        # different (e.g. natively y-down), this flip would be WRONG for
-        # that data and would re-introduce upside-down rendering. Worth
-        # independently re-confirming this against handwriting_rnn.py's
-        # actual output convention -- I have not been able to verify this
-        # against that file since it wasn't available to test against.
-        pts_px = [((x - min_x) * mm_to_px, (max_y - y) * mm_to_px) for x, y in stroke]
+        # NOTE: direct mapping, no y-flip. Both HandwritingGenerator
+        # (Hershey-based, handwriting_bot.py) and RNNHandwritingGenerator
+        # (handwriting_rnn.py, as of its own y-negation fix -- see that
+        # file's "Y-AXIS DIRECTION" note) produce strokes where y already
+        # increases DOWNWARD, matching PIL's pixel space directly. A
+        # previous version of this function applied a (max_y - y) flip
+        # here based on an incorrect assumption about the RNN's raw
+        # output convention -- confirmed wrong via the RNN repo's own
+        # reference SVG-writer (which explicitly negates y itself,
+        # meaning ITS raw output is upward-increasing, but
+        # RNNHandwritingGenerator now corrects that upstream, so by the
+        # time strokes reach this function they're already downward-y
+        # like everything else in this project). If you introduce a THIRD
+        # stroke source with a different native convention, convert it to
+        # downward-y at its own source, not here -- this function should
+        # stay convention-agnostic and assume its input already matches
+        # the rest of the pipeline.
+        pts_px = [((x - min_x) * mm_to_px, (y - min_y) * mm_to_px) for x, y in stroke]
         draw.line(pts_px, fill=0, width=line_width_px, joint="curve")
 
     return img
@@ -329,6 +327,8 @@ class VerifiedRNNHandwritingGenerator:
         similarity_threshold: float = 0.80,
         min_confidence: float = 0.3,
         max_retries: int = 3,
+        retry_below_similarity: float = 0.50,
+        similarity_retry_max_attempts: int = 15,
         on_flag: Optional[Callable[[str, str, float], None]] = None,
         on_low_confidence: Optional[Callable[[str, str, float], bool]] = None,
         width_deviation_threshold: float = 0.25,
@@ -336,6 +336,28 @@ class VerifiedRNNHandwritingGenerator:
         max_spacing_cov: float = 0.5,
     ):
         """
+        retry_below_similarity / similarity_retry_max_attempts: if a line's
+        raw character-similarity score (text_similarity, 0.0-1.0 --
+        e.g. 0.50 means 50%) comes back below retry_below_similarity, the
+        line is regenerated and re-recognized, up to
+        similarity_retry_max_attempts times, until it scores at or above
+        that bar. This uses the raw similarity ratio directly (the same
+        one text_similarity() returns), not the length-scaled
+        is_close_enough() check used elsewhere in this file for the final
+        accept/reject decision -- so this is specifically "did this
+        attempt score at least X%", matching a plain percentage read of
+        the recognized text.
+
+        Worth knowing: a fixed percentage threshold like this doesn't
+        scale evenly with word length (verified earlier: 'the' vs 'thc',
+        one real character error, scored 0.667, while 'everything' vs
+        'evenjthng', three real errors, scored 0.737 -- so the same 50%
+        cutoff is comparatively strict on short words and comparatively
+        lenient on long ones). That's a real property of ratio-based
+        scoring, not a bug in this retry rule -- just something to keep in
+        mind if you're tuning retry_below_similarity and seeing it behave
+        differently than expected across line lengths.
+
         min_confidence: minimum average OCR confidence (0.0-1.0) an
         attempt must ALSO clear, on top of passing is_close_enough(), to
         be accepted. This exists because OCR models with language-model
@@ -378,6 +400,8 @@ class VerifiedRNNHandwritingGenerator:
         self.similarity_threshold = similarity_threshold
         self.min_confidence = min_confidence
         self.max_retries = max_retries
+        self.retry_below_similarity = retry_below_similarity
+        self.similarity_retry_max_attempts = similarity_retry_max_attempts
         self.on_flag = on_flag
         self.on_low_confidence = on_low_confidence
         self.width_deviation_threshold = width_deviation_threshold
@@ -421,10 +445,7 @@ class VerifiedRNNHandwritingGenerator:
         num_spaces = line_text.count(" ")
 
         # Best-by-similarity candidate seen so far (used for the flagged_lines
-        # fallback if text recognition itself never succeeds). Tracked via
-        # text_similarity purely as a human-readable "how close did we get"
-        # ranking for reporting -- the actual accept/reject decision below
-        # uses is_close_enough() + confidence, not this ratio.
+        # fallback if text recognition itself never succeeds).
         best_strokes = None
         best_similarity = -1.0
         best_recognized = ""
@@ -453,8 +474,12 @@ class VerifiedRNNHandwritingGenerator:
                 return strokes, None, None, True, None
 
             recognized, conf = self.verifier.recognize(img)
-            similarity = text_similarity(recognized, line_text)  # kept for reporting only
-            text_ok = is_close_enough(line_text, recognized, self.similarity_threshold)
+            similarity = text_similarity(recognized, line_text)
+            # The actual retry trigger: a raw similarity score below
+            # retry_below_similarity (default 0.50, i.e. 50%) means this
+            # attempt gets rejected and the line is regenerated -- see
+            # retry_below_similarity in __init__ for the full explanation.
+            similarity_ok = similarity >= self.retry_below_similarity
             conf_ok = conf >= self.min_confidence
 
             # Track the best-seen attempt by similarity for reporting
@@ -466,7 +491,7 @@ class VerifiedRNNHandwritingGenerator:
                 best_confidence = conf
 
             spacing_ok = True
-            if self.check_spacing and text_ok and conf_ok:
+            if self.check_spacing and similarity_ok and conf_ok:
                 spacing_ok, spacing_cov, gaps = measure_word_gap_consistency(
                     strokes, num_spaces, self.max_spacing_cov)
                 if not spacing_ok:
@@ -481,15 +506,15 @@ class VerifiedRNNHandwritingGenerator:
                     best_spacing_ok_strokes = strokes
                     best_spacing_ok_recognized = recognized
 
-            return strokes, recognized, (text_ok and conf_ok), spacing_ok, conf
+            return strokes, recognized, (similarity_ok and conf_ok), spacing_ok, conf
 
         def is_fully_acceptable(text_and_conf_ok, spacing_ok):
             return bool(text_and_conf_ok) and spacing_ok
 
-        # Automatic retry phase. An attempt is only accepted immediately if
-        # it passes text closeness AND confidence AND (when enabled)
-        # word-gap consistency.
-        for _attempt in range(self.max_retries + 1):
+        # Automatic retry phase: any attempt scoring below
+        # retry_below_similarity gets thrown out and regenerated, up to
+        # similarity_retry_max_attempts times.
+        for _attempt in range(self.similarity_retry_max_attempts + 1):
             strokes, recognized, text_and_conf_ok, spacing_ok, conf = attempt_once()
             if not strokes:
                 return strokes
@@ -536,6 +561,8 @@ class VerifiedRNNHandwritingGenerator:
             "recognized": best_recognized,
             "similarity": best_similarity,
             "confidence": best_confidence,
+            "retry_below_similarity": self.retry_below_similarity,
+            "retries_allowed": self.similarity_retry_max_attempts,
         })
         if self.on_flag:
             self.on_flag(line_text, best_recognized, best_similarity)
