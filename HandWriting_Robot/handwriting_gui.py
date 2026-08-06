@@ -78,6 +78,20 @@ FONT_PRESETS = {
     },
 }
 
+# Limit switch pin assignments, confirmed on hardware (Port B on the EBB
+# board's unused IO header): B5 = X-axis minimum, B6 = X-axis maximum,
+# B7 = Y-axis reference. Homing drives toward B6/B7 (the "home corner");
+# B5 is available if you want to also measure full X travel later.
+# Each tuple is (port, pin, triggered_value) -- triggered_value is the PI
+# response that means "switch active": the mechanical switches here read
+# '1' when pressed, but the hall-effect sensor on B7 is active-LOW
+# (confirmed: reads '1' at rest with no magnet present, '0' when the
+# magnet is present) -- so its triggered_value is '0', the opposite of
+# the mechanical switches.
+SWITCH_X_MIN = ("B", "5", "1")
+SWITCH_X_MAX = ("B", "6", "1")
+SWITCH_Y = ("B", "7", "0")  # hall-effect sensor, active-low
+
 
 # --------------------------------------------------------------------------
 # A queue-backed writer so background-thread print() output can be safely
@@ -286,9 +300,17 @@ class HandwritingApp(tk.Tk):
                    command=self._on_disable_motors).pack(side="left", padx=8)
         ttk.Button(motor_row, text="Go to Home (0,0)", command=self._on_go_home).pack(side="left", padx=8)
 
+        home_switches_row = ttk.Frame(conn_frame)
+        home_switches_row.grid(row=3, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+        ttk.Button(home_switches_row, text="Home to limit switches",
+                   command=self._on_home_switches).pack(side="left")
+        ttk.Label(home_switches_row,
+                  text="(drives to X-max/Y switches, sets that as origin)",
+                  foreground="#8a8378").pack(side="left", padx=8)
+
         self.motor_status_var = tk.StringVar(value="Motors: unknown")
         ttk.Label(conn_frame, textvariable=self.motor_status_var, foreground="#8a8378").grid(
-            row=3, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+            row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
 
         # --- Actions ---
         action_frame = ttk.Frame(main_tab)
@@ -691,6 +713,19 @@ class HandwritingApp(tk.Tk):
                     break
         return lines
 
+    def _ebb_write_no_wait(self, ser, cmd):
+        """
+        Sends a command WITHOUT reading its response at all. Used for move
+        commands (XM/SM) during fast homing, where we don't care about the
+        move's own OK acknowledgment -- we only care about the switch state.
+        Skipping this read removes a full command round-trip of latency
+        from every chunk. The response is left unread in the input buffer;
+        see _ebb_read_switch's reset_input_buffer() call, which discards it
+        before the next real (switch) read so it never gets confused for
+        that read's actual response.
+        """
+        ser.write((cmd + "\r").encode())
+
     def _ebb_query_position(self, ser):
         """Query current raw axis step counts via QS. Returns (axis1, axis2) or (None, None)."""
         lines = self._ebb_send(ser, "QS")
@@ -702,6 +737,40 @@ class HandwritingApp(tk.Tk):
                 except ValueError:
                     continue
         return None, None
+
+    def _ebb_read_switch(self, ser, port, pin, flush_first=True):
+        """
+        Send one PI query for a limit switch pin. Returns '0'/'1' or None on
+        a bad response.
+
+        flush_first: discards anything already sitting unread in the input
+        buffer before sending the query -- specifically the leftover OK
+        acknowledgment from a prior _ebb_write_no_wait() move command that
+        was never read. Without this, that stale OK could be mistaken for
+        this query's response (see _ebb_write_no_wait's docstring). Always
+        True during fast homing; safe to leave True elsewhere too since
+        there's normally nothing pending to flush.
+        """
+        if flush_first:
+            ser.reset_input_buffer()
+        lines = self._ebb_send(ser, f"PI,{port},{pin}", timeout=2)
+        for line in lines:
+            if line.startswith("PI,"):
+                return line.split(",")[1]
+        return None
+
+    def _ebb_switch_debounced(self, ser, port, pin, confirm_count=3, poll_interval_s=0.005,
+                               triggered_value="1"):
+        """Requires confirm_count consecutive reads matching triggered_value before
+        treating the switch as actually triggered -- rejects mechanical bounce/noise
+        on a single-read basis. triggered_value lets active-low sensors (like the
+        hall-effect switch, which reads '0' when triggered) share this same helper
+        with the active-high mechanical switches (which read '1' when triggered)."""
+        for _ in range(confirm_count):
+            if self._ebb_read_switch(ser, port, pin) != triggered_value:
+                return False
+            time.sleep(poll_interval_s)
+        return True
 
     def _run_motor_action(self, action_name, fn):
         """Shared wrapper: open the selected serial port, run fn(ser), report success/failure."""
@@ -762,6 +831,155 @@ class HandwritingApp(tk.Tk):
             a2, b2 = self._ebb_query_position(ser)
             self.log_queue.put(f"Done. Position is now axis1={a2}, axis2={b2}.\n")
         self._run_motor_action("Going to home position", fn)
+
+    def _on_home_switches(self):
+        """
+        Physical homing using the three confirmed limit switches:
+            B5 = X minimum, B6 = X maximum, B7 = Y reference.
+        Drives toward B6 (X-max) and B7 (Y) -- the "home corner" -- using
+        XM moves (same CoreXY-aware command handwriting_ebb.py uses for
+        real drawing, so this matches production motion exactly). Once
+        both switches confirm a debounced trigger, zeroes the position
+        with CS so (0,0) corresponds to that physical corner.
+
+        Firmware note: EBB v2.6.5 has no automatic hardware limit-stop
+        (that's a v3.0 feature), so this polls PI in software and issues
+        ES the instant a press is detected.
+
+        Direction signs (currently -X, -Y) are a starting assumption, NOT
+        yet verified on this specific machine -- if the carriage moves away
+        from the switches instead of toward them, flip HOME_DX_SIGN /
+        HOME_DY_SIGN below.
+
+        SPEED: uses a two-phase seek, the same technique real CNC/3D-printer
+        firmware uses for homing -- a fast bulk move to find the switch
+        roughly, then back off a little and re-approach slowly for an
+        accurate, debounced stop. This is much faster overall than a single
+        slow crawl the whole distance, without losing stopping precision
+        right at the switch (previously every single chunk -- even ones far
+        from the switch -- moved at the same ~0.25mm/40ms crawl speed,
+        which is what looked like "one tick per second").
+        """
+        HOME_DX_SIGN = 1          # toward X-MAX (B6) now -- flipped from -1 since that
+                                   # was homing toward X-min (B5). VERIFY on real hardware:
+                                   # if the carriage moves toward B5 instead, flip this back.
+        HOME_DY_SIGN = 1  # flipped from -1 -- was moving away from the Y switch
+
+        # Fast seek phase: queues several small XM moves back-to-back with
+        # ZERO waiting in between (not even the fire-and-forget version's
+        # per-chunk sleep-then-check) -- the EBB's own onboard move queue
+        # chains and executes them itself, so the carriage moves
+        # continuously through a whole batch with no serial round-trip
+        # gaps stitched into the motion. The switch is only checked once
+        # per BATCH, not once per chunk, which is what actually removes
+        # the visible stutter (checking less often is the direct tradeoff
+        # for smoother motion -- see BACKOFF_STEPS note below).
+        FAST_STEP = 360           # ~4.5mm per chunk at steps_per_mm=80
+        FAST_CHUNK_MS = 50        # -> exactly 90mm/s per chunk
+        BATCH_SIZE = 8            # chunks queued per batch -> ~36mm, ~400ms of continuous motion
+        MAX_FAST_BATCHES = 100    # safety cutoff -- ~100*36mm = 3600mm of travel
+
+        # Back-off distance after the fast phase first sees the switch,
+        # before the slow precise re-approach. Must comfortably exceed one
+        # FULL BATCH's worth of possible overshoot (~36mm), since the
+        # switch is now only checked between batches, not between chunks --
+        # checking less often directly means a bigger worst-case overshoot
+        # to back off from.
+        BACKOFF_STEPS = 3200      # ~40mm
+
+        # Slow precise approach: fire-and-forget (like the fast phase) --
+        # no waiting for XM's OK -- with a debounced switch check between
+        # steps. Previously this waited for BOTH the debounced check AND
+        # the move's OK response every single 0.25mm chunk, stacking two
+        # extra serial round-trips onto every tiny step; removing that
+        # wait, plus a slightly bigger step, should make this feel much
+        # less crawl-like while still stopping accurately at the switch.
+        SLOW_STEP = 30            # ~0.375mm per chunk
+        SLOW_CHUNK_MS = 25        # -> ~15mm/s (still far slower than the 90mm/s fast phase)
+        MAX_SLOW_CHUNKS = 300     # ~300*0.375mm = 112.5mm -- covers the backoff distance
+        CONFIRM_COUNT = 2         # still rejects bounce, one fewer confirm read than before
+
+        def home_one_axis(ser, label, dx_sign, dy_sign, switch_port, switch_pin,
+                           switch_triggered_value="1"):
+            self.log_queue.put(f"Homing {label} (fast seek, pipelined)...\n")
+            dx_fast, dy_fast = dx_sign * FAST_STEP, dy_sign * FAST_STEP
+
+            found = False
+            for _ in range(MAX_FAST_BATCHES):
+                # Check BEFORE moving, so an already-triggered switch is
+                # caught with zero movement (e.g. if homing is re-run while
+                # already sitting at the switch).
+                if self._ebb_read_switch(ser, switch_port, switch_pin) == switch_triggered_value:
+                    found = True
+                    break
+                # Queue the whole batch with back-to-back writes -- no read,
+                # no sleep between them. The board's own move queue is what
+                # chains these into continuous motion; we only block once,
+                # after the whole batch, for the combined duration.
+                for _ in range(BATCH_SIZE):
+                    self._ebb_write_no_wait(ser, f"XM,{FAST_CHUNK_MS},{dx_fast},{dy_fast}")
+                time.sleep(BATCH_SIZE * FAST_CHUNK_MS / 1000.0)
+            self._ebb_send(ser, "ES")  # stop the fast move immediately either way
+
+            if not found:
+                self.log_queue.put(f"WARNING: {label} homing timed out during fast seek -- "
+                                   f"switch never triggered. Check wiring, or flip the "
+                                   f"direction sign if the carriage moved the wrong way.\n")
+                return False
+
+            self.log_queue.put(f"{label} switch found -- backing off for precise re-approach...\n")
+            self._ebb_send(ser, "EM,1,1")  # re-enable in case ES halted the motors
+            dx_back, dy_back = -dx_sign * BACKOFF_STEPS, -dy_sign * BACKOFF_STEPS
+            # Duration scaled to BACKOFF_STEPS' actual distance at the same
+            # ~90mm/s fast-phase speed (FAST_STEP/FAST_CHUNK_MS ratio) --
+            # previously this reused FAST_CHUNK_MS directly, which meant a
+            # ~40mm move was told to complete in 50ms (~800mm/s, physically
+            # impossible), so the motors just stalled/skipped and the
+            # carriage never actually moved off the switch.
+            backoff_duration_ms = max(1, round(BACKOFF_STEPS / FAST_STEP * FAST_CHUNK_MS))
+            self._ebb_send(ser, f"XM,{backoff_duration_ms},{dx_back},{dy_back}", timeout=2)
+            time.sleep(backoff_duration_ms / 1000.0 + 0.05)
+
+            dx_slow, dy_slow = dx_sign * SLOW_STEP, dy_sign * SLOW_STEP
+            for _ in range(MAX_SLOW_CHUNKS):
+                if self._ebb_switch_debounced(ser, switch_port, switch_pin, CONFIRM_COUNT,
+                                               triggered_value=switch_triggered_value):
+                    self._ebb_send(ser, "ES")
+                    self.log_queue.put(f"{label} homed precisely.\n")
+                    return True
+                self._ebb_write_no_wait(ser, f"XM,{SLOW_CHUNK_MS},{dx_slow},{dy_slow}")
+                time.sleep(SLOW_CHUNK_MS / 1000.0)
+            self._ebb_send(ser, "ES")
+            self.log_queue.put(f"WARNING: {label} slow re-approach timed out -- try increasing "
+                               f"BACKOFF_STEPS if this keeps happening.\n")
+            return False
+
+        def fn(ser):
+            self.log_queue.put("Configuring limit switch pins as inputs...\n")
+            for port, pin, _triggered in (SWITCH_X_MIN, SWITCH_X_MAX, SWITCH_Y):
+                self._ebb_send(ser, f"PD,{port},{pin},1")
+
+            self._ebb_send(ser, "EM,1,1")
+            self.log_queue.put("__MOTOR_STATUS__:Motors: enabled")
+
+            x_port, x_pin, x_triggered = SWITCH_X_MAX
+            if not home_one_axis(ser, "X (toward max)", HOME_DX_SIGN, 0, x_port, x_pin,
+                                  switch_triggered_value=x_triggered):
+                return
+
+            self._ebb_send(ser, "EM,1,1")  # re-enable in case ES left motors halted
+
+            y_port, y_pin, y_triggered = SWITCH_Y
+            if not home_one_axis(ser, "Y", 0, HOME_DY_SIGN, y_port, y_pin,
+                                  switch_triggered_value=y_triggered):
+                return
+
+            self._ebb_send(ser, "EM,1,1")
+            self._ebb_send(ser, "CS")
+            self.log_queue.put("__MOTOR_STATUS__:Motors: homed, origin zeroed")
+            self.log_queue.put("Homing complete -- origin (0,0) set at the X-max/Y switch corner.\n")
+
+        self._run_motor_action("Homing to limit switches", fn)
 
     def _on_test_pen(self):
         if self.busy:
